@@ -1,0 +1,5 @@
+menuconfig MODULES_MY_MISSION
+	bool "My Mission Module"
+	default n
+	---help---
+		Enable support for My Mission custom module
