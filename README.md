@@ -13,6 +13,8 @@ chmod +x scripts/setup_firmware.sh
 ```
 The script uses the parent folder of this repo and creates `PX4-Autopilot` there automatically.
 This script is intended for Ubuntu, requires `sudo`, and installs PX4 `v1.15.1` with Gazebo-Classic 11.
+It uses a recursive PX4 clone with `--depth 1` for a simpler and more compatible setup.
+If `pip` is already installed, the script downgrades it to a PX4 `v1.15.1` compatible version before running `ubuntu.sh`.
 
 2. Copy this repo's module and PX4 config files:
 ```bash
@@ -32,13 +34,17 @@ The script copies:
 - `boards/px4/sitl/default.px4board`
 - `boards/px4/fmu-v6x/default.px4board`
 
-3. Recommended params (already included in `10050_gazebo-classic_my_vehicle`, if using TFMINI for Z estimation):
+3. Recommended params:
+- SITL already includes:
 ```txt
-SENS_TFMINI_CFG = 103 # TELEM 3
 EKF2_HGT_REF = 2
 EKF2_RNG_CTRL = 2
 EKF2_RNG_A_HMAX = 10.000
 EKF2_RNG_A_VMAX = 2.0
+```
+- Real flight with TFMINI for Z estimation also needs:
+```txt
+SENS_TFMINI_CFG = 103 # TELEM 3
 ```
 4. Build and flash (Pixhawk)
 ```bash
@@ -50,9 +56,9 @@ make px4_fmu-v6x_default upload
 ```bash
 # build
 cd ../PX4-Autopilot
-make px4_sitl_default gazebo-classic_my_vehicle
+make -j px4_sitl_default gazebo-classic_my_vehicle
 ```
-Enters **MISSON MODE**, `my_mission` runs automatically.
+Enters **MISSION MODE**, `my_mission` runs automatically.
 If switched to **HOLD**, the mission is aborted and the vehicle hovers.
 ```bash
 # run
