@@ -66,4 +66,15 @@ commander mode auto:mission # mission mode
 # stop
 commander mode auto:loiter # hold mode
 ```
+
+## My Mission Params
+`my_mission` uses PX4 params so the same firmware can run different simple mission patterns:
+```bash
+param set MYMIS_ALT 2.0       # altitude above home, meters
+param set MYMIS_DIST 2.0      # horizontal leg distance, meters
+param set MYMIS_HOLD_T 2.0    # hold time at each waypoint, seconds
+param set MYMIS_ACC_RAD 0.25  # waypoint acceptance radius, meters
+param set MYMIS_TIMEOUT 15.0  # per-waypoint timeout, seconds
+param set MYMIS_PATTERN 0     # 0=line, 1=square, 2=out-and-back
+```
 ![Demo Animation](images/demo.gif)
