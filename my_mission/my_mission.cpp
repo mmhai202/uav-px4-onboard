@@ -8,55 +8,19 @@
  * 4. Switch to HOLD to Abort.
  */
 
-#include <px4_platform_common/px4_config.h>
-#include <px4_platform_common/tasks.h>
-#include <px4_platform_common/module.h>
-#include <px4_platform_common/module_params.h>
-#include <drivers/drv_hrt.h>
+#include "MyMission.hpp"
+#include "MissionPlanner.hpp"
 
 // uORB Topics
-#include <uORB/Publication.hpp>
-#include <uORB/topics/vehicle_command.h>
 #include <uORB/topics/offboard_control_mode.h>
 #include <uORB/topics/trajectory_setpoint.h>
 #include <uORB/topics/vehicle_local_position.h>
 #include <uORB/topics/vehicle_status.h>
 
 using namespace time_literals;
-
-class MyMission : public ModuleBase<MyMission>, public ModuleParams {
-public:
-    MyMission(int example_param, bool example_flag) : ModuleParams(nullptr) {}
-    virtual ~MyMission() = default;
-
-    static int task_spawn(int argc, char *argv[]);
-    static MyMission *instantiate(int argc, char *argv[]);
-    static int custom_command(int argc, char *argv[]) { return print_usage("unknown command"); }
-    static int print_usage(const char *reason = nullptr);
-
-    void run() override;
-
-private:
-    // --- Configuration ---
-    static constexpr float TARGET_ALT   = -2.0f; // 2m Altitude
-    static constexpr float MOVE_DIST    =  2.0f; // 2m Distance
-    static constexpr time_t WAIT_TIME   =  2_s;  // Wait time at waypoints
-
-    // --- State Machine ---
-    enum State {
-        IDLE,            // Waiting for MISSION mode
-        WARMUP,          // Switching to Offboard
-        TAKEOFF,
-        HOLD_TOP,
-        MOVE_RIGHT,
-        HOLD_SIDE,
-        TRIGGER_LAND,
-        MONITOR_LANDING,
-        EXIT
-    } _state = IDLE;
-
-    void send_vehicle_command(uORB::Publication<vehicle_command_s>& pub, uint16_t command, float p1 = 0.0f, float p2 = 0.0f);
-};
+using my_mission::MAX_WAYPOINTS;
+using my_mission::MissionConfig;
+using my_mission::Waypoint;
 
 void MyMission::run() {
     // Subscriptions
@@ -75,8 +39,16 @@ void MyMission::run() {
 
     uint64_t start_time = 0;
     uint64_t state_time = 0;
-    float home_x = 0.0f, home_y = 0.0f;
+    uint64_t last_position_valid_time = 0;
+    float home_x = 0.0f, home_y = 0.0f, home_z = 0.0f;
     bool home_set = false;
+
+    // Mission params are sampled once at trigger time and expanded into a fixed
+    // waypoint list. This makes the active mission deterministic until landing.
+    MissionConfig config{};
+    Waypoint waypoints[MAX_WAYPOINTS]{};
+    int waypoint_count = 0;
+    int current_waypoint = 0;
 
     PX4_INFO("Mission Ready. Upload a Dummy Mission, Arm, then switch to MISSION mode to Start.");
 
@@ -106,6 +78,7 @@ void MyMission::run() {
                 bool is_position_valid = pos.xy_valid && pos.z_valid;
                 if (is_position_valid) {
                     PX4_INFO("GPS OK. Hijacking control to Offboard...");
+                    updateParams();
                     start_time = hrt_absolute_time();
                     _state = WARMUP;
                 } else {
@@ -117,6 +90,13 @@ void MyMission::run() {
                     }
                 }
             }
+        }
+
+        // Used by the Offboard mission as an internal watchdog. The commander
+        // still owns the real failsafe policy; this only stops us sending stale
+        // position setpoints if local position drops out.
+        if (pos.xy_valid && pos.z_valid) {
+            last_position_valid_time = hrt_absolute_time();
         }
 
         // --- Offboard Heartbeat ---
@@ -137,14 +117,22 @@ void MyMission::run() {
             break;
 
         case WARMUP:
-            // Lock Home
-            if (!home_set && pos.z_valid) {
-                home_x = pos.x; home_y = pos.y; home_set = true;
+            // Lock the local-frame home once. All generated waypoints are
+            // relative to this point, not to later vehicle drift.
+            if (!home_set && pos.xy_valid && pos.z_valid) {
+                home_x = pos.x; home_y = pos.y; home_z = pos.z; home_set = true;
+                config = mission_config();
+                waypoint_count = my_mission::build_waypoints(waypoints, MAX_WAYPOINTS, home_x, home_y, home_z, config);
+                current_waypoint = 0;
+
+                PX4_INFO("Mission pattern %d, %d waypoints: alt %.1fm dist %.1fm",
+                         config.pattern, waypoint_count, (double)config.altitude_m, (double)config.distance_m);
             }
             sp.position[0] = home_x; sp.position[1] = home_y; sp.position[2] = pos.z;
 
-            // Wait 1s to ensure Offboard signal is stable, then Switch Mode
-            if (hrt_absolute_time() - start_time > 1_s) {
+            // PX4 requires a stream of Offboard setpoints before accepting the
+            // mode switch, so WARMUP publishes hold-position setpoints first.
+            if (home_set && waypoint_count > 0 && hrt_absolute_time() - start_time > 1_s) {
                 PX4_INFO("Switching to Offboard...");
                 send_vehicle_command(_cmd_pub, vehicle_command_s::VEHICLE_CMD_DO_SET_MODE, 1, 6); // 6 = Offboard
                 
@@ -153,43 +141,54 @@ void MyMission::run() {
                     send_vehicle_command(_cmd_pub, vehicle_command_s::VEHICLE_CMD_COMPONENT_ARM_DISARM, 1);
                 }
                 
-                _state = TAKEOFF;
+                _state = GOTO_WAYPOINT;
                 state_time = hrt_absolute_time();
             }
             break;
 
-        case TAKEOFF:
-            sp.position[0] = home_x; sp.position[1] = home_y; sp.position[2] = TARGET_ALT;
-            if (pos.z < (TARGET_ALT + 0.2f)) {
-                PX4_INFO("Altitude Reached. Hovering...");
-                _state = HOLD_TOP;
+        case GOTO_WAYPOINT: {
+            const Waypoint &target = waypoints[current_waypoint];
+            sp.position[0] = target.x; sp.position[1] = target.y; sp.position[2] = target.z; sp.yaw = target.yaw;
+
+            // If position becomes invalid after Offboard takeover, hand back to
+            // PX4 landing instead of continuing to publish old setpoints.
+            if (hrt_absolute_time() - last_position_valid_time > 1_s) {
+                PX4_ERR("Position invalid during mission. Landing.");
+                _state = TRIGGER_LAND;
+                break;
+            }
+
+            if (my_mission::reached_waypoint(pos, target, config.acceptance_radius_m)) {
+                PX4_INFO("Waypoint %d/%d reached. Holding.", current_waypoint + 1, waypoint_count);
+                _state = HOLD_WAYPOINT;
                 state_time = hrt_absolute_time();
+                break;
             }
-            break;
 
-        case HOLD_TOP:
-            sp.position[0] = home_x; sp.position[1] = home_y; sp.position[2] = TARGET_ALT;
-            if (hrt_absolute_time() - state_time > WAIT_TIME) {
-                PX4_INFO("Moving Right...");
-                _state = MOVE_RIGHT;
-            }
-            break;
-
-        case MOVE_RIGHT:
-            sp.position[0] = home_x; sp.position[1] = home_y + MOVE_DIST; sp.position[2] = TARGET_ALT;
-            if (pos.y > (home_y + MOVE_DIST - 0.2f)) {
-                PX4_INFO("Target Reached. Hovering...");
-                _state = HOLD_SIDE;
-                state_time = hrt_absolute_time();
-            }
-            break;
-
-        case HOLD_SIDE:
-            sp.position[0] = home_x; sp.position[1] = home_y + MOVE_DIST; sp.position[2] = TARGET_ALT;
-            if (hrt_absolute_time() - state_time > WAIT_TIME) {
+            if (hrt_absolute_time() - state_time > config.waypoint_timeout_us) {
+                PX4_ERR("Waypoint %d timeout. Landing.", current_waypoint + 1);
                 _state = TRIGGER_LAND;
             }
             break;
+        }
+
+        case HOLD_WAYPOINT: {
+            const Waypoint &target = waypoints[current_waypoint];
+            sp.position[0] = target.x; sp.position[1] = target.y; sp.position[2] = target.z; sp.yaw = target.yaw;
+
+            if (hrt_absolute_time() - state_time > config.hold_time_us) {
+                current_waypoint++;
+
+                if (current_waypoint >= waypoint_count) {
+                    _state = TRIGGER_LAND;
+                } else {
+                    PX4_INFO("Moving to waypoint %d/%d.", current_waypoint + 1, waypoint_count);
+                    _state = GOTO_WAYPOINT;
+                    state_time = hrt_absolute_time();
+                }
+            }
+            break;
+        }
 
         case TRIGGER_LAND:
             PX4_INFO("Mission Done. Auto Landing...");
@@ -217,6 +216,19 @@ void MyMission::run() {
 
     orb_unsubscribe(local_pos_sub);
     orb_unsubscribe(status_sub);
+}
+
+MissionConfig MyMission::mission_config() const
+{
+    MissionConfig config{};
+    config.altitude_m = my_mission::constrain_float(_param_mymis_alt.get(), 0.5f, 20.0f);
+    config.distance_m = my_mission::constrain_float(_param_mymis_dist.get(), 0.5f, 50.0f);
+    config.hold_time_us = my_mission::seconds_to_us(my_mission::constrain_float(_param_mymis_hold_t.get(), 0.0f, 30.0f));
+    config.acceptance_radius_m = my_mission::constrain_float(_param_mymis_acc_rad.get(), 0.1f, 2.0f);
+    config.waypoint_timeout_us = my_mission::seconds_to_us(my_mission::constrain_float(_param_mymis_timeout.get(), 2.0f, 120.0f));
+    config.pattern = my_mission::normalized_pattern(_param_mymis_pattern.get());
+
+    return config;
 }
 
 void MyMission::send_vehicle_command(uORB::Publication<vehicle_command_s>& pub, uint16_t command, float p1, float p2) {

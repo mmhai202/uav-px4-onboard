@@ -6,6 +6,8 @@ DEV_ROOT=${1:-"${REPO_ROOT}/.."}
 
 cd "${DEV_ROOT}"
 
+sudo -v
+
 if [ ! -d PX4-Autopilot ]; then
     git clone -b v1.15.1 --recursive --depth 1 https://github.com/PX4/PX4-Autopilot.git
 fi
